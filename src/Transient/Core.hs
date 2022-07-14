@@ -187,7 +187,6 @@ data EntityField ent i o = EntityField
     }
 
 type SimpleField rec a = EntityField rec a a
-
 instance AutoType t => IsString (EntityField r t t) where
     fromString s = EntityField (fromString s) auto
 

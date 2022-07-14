@@ -3,6 +3,7 @@ module Transient.PostgreSQL.Backend
     where
 
 import           Control.Exception                    (bracket, throwIO)
+import           Control.Monad                        (when)
 import qualified Data.ByteString                      as BS
 import           Data.Coerce                          (coerce)
 import           Data.Either                          (fromRight)
@@ -44,11 +45,17 @@ mkDialect conn =
         }
 
 runQuery :: PS.Connection -> BS.ByteString -> [SqlValue] -> IO [[SqlValue]]
-runQuery conn q vals =
+runQuery conn q vals = do
+    print q
+    when (not $ null vals) $
+        print vals 
     unV $ query conn (Query q) (fmap valToField vals)
 
 runExecute :: PS.Connection -> BS.ByteString -> [SqlValue] -> IO Int64
-runExecute conn q vals =
+runExecute conn q vals = do
+    print q
+    when (not $ null vals) $
+        print vals 
     execute conn (Query q) (fmap valToField vals)
 
 unV :: IO [[V]] -> IO [[SqlValue]]

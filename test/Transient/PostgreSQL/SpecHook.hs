@@ -15,11 +15,12 @@ withConnection :: (Backend -> IO a) -> IO a
 withConnection =
     withBackend connectInfo
 
+withTransaction :: Backend -> (Backend -> IO a) -> IO a
+withTransaction conn action =
+    bracket
+     (connExecute conn "BEGIN TRANSACTION" [])
+     (\_ -> connExecute conn "ROLLBACK" [])
+     (\_ -> action conn)
+
 hook :: SpecWith Backend -> Spec
-hook =
-    aroundAll withConnection .
-        aroundWith (\action conn ->
-            bracket
-             (connExecute conn "BEGIN TRANSACTION" [])
-             (\_ -> connExecute conn "ROLLBACK" [])
-             (\_ -> action conn))
+hook = aroundAll withConnection
