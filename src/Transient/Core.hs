@@ -126,15 +126,14 @@ bool =
             _         -> Nothing
         )
 
-type FromRowFn a = [SqlValue] -> Maybe (a, [SqlValue])
+type Encoder a = a -> [SqlValue]
+type Decoder a = [SqlValue] -> Maybe (a, [SqlValue])
 
-fieldParser :: SqlType' x a -> FromRowFn a
+fieldParser :: SqlType' x a -> Decoder a
 fieldParser sqlType vs = do
     let vHead:vTail = vs
     r <- fromSqlType sqlType vHead
     pure (r, vTail)
-
-type ToRowFn a = a -> [SqlValue]
 
 data FieldDef = FieldDef
     { fieldName        :: BS.ByteString
@@ -143,43 +142,42 @@ data FieldDef = FieldDef
     } deriving Show
 
 data Table i o = Table
-    { tableToRow   :: ToRowFn i
-    , tableFromRow :: FromRowFn o
+    { tableEncoder :: Encoder i
+    , tableDecoder :: Decoder o
     , tableName    :: BS.ByteString
     , tableFields  :: [FieldDef]
     }
 
 data Fields i o = Fields
-    { fieldsToRow     :: ToRowFn i
-    , fieldsFromRow   :: FromRowFn o
+    { fieldsEncoder   :: Encoder i
+    , fieldsDecoder   :: Decoder o
     , fieldsFieldDefs :: [FieldDef]
     } deriving Functor
 
 instance Applicative (Fields i) where
     pure a = Fields
-        { fieldsFromRow = \vs -> Just (a, vs)
-        , fieldsToRow = \_ -> []
+        { fieldsDecoder = \vs -> Just (a, vs)
+        , fieldsEncoder = \_ -> []
         , fieldsFieldDefs = []
         }
 
     a <*> b = Fields
-        { fieldsFromRow = \vals -> do
-            (f, vals2) <- fieldsFromRow a vals
-            (a, rest) <- fieldsFromRow b vals2
+        { fieldsDecoder = \vals -> do
+            (f, vals2) <- fieldsDecoder a vals
+            (a, rest) <- fieldsDecoder b vals2
             pure (f a, rest)
-        , fieldsToRow = fieldsToRow a <> fieldsToRow b
+        , fieldsEncoder = fieldsEncoder a <> fieldsEncoder b
         , fieldsFieldDefs = fieldsFieldDefs a <> fieldsFieldDefs b
         }
 
 table :: BS.ByteString -> Fields i o -> Table i o
 table tableName fields =
     Table
-        { tableToRow = fieldsToRow fields
-        , tableFromRow = fieldsFromRow fields
+        { tableEncoder = fieldsEncoder fields
+        , tableDecoder = fieldsDecoder fields
         , tableFields = fieldsFieldDefs fields
         , tableName = tableName
         }
-
 
 data EntityField ent i o = EntityField
     { entityFieldName :: BS.ByteString
@@ -201,8 +199,8 @@ field :: (rec -> i) -> EntityField x i o -> Fields rec o
 field fromRec f@(EntityField _ t) =
     Fields
         { fieldsFieldDefs = [fieldDef f]
-        , fieldsFromRow = fieldParser t
-        , fieldsToRow = List.singleton . toSqlType t . fromRec
+        , fieldsDecoder = fieldParser t
+        , fieldsEncoder = List.singleton . toSqlType t . fromRec
         }
 
 createTable :: Backend -> Table i o -> IO Int64
@@ -224,5 +222,5 @@ insertMany c t vals =
     in connExecute c
         ("INSERT INTO " <> tableName t
                    <> " (" <> commas (fmap fieldName (tableFields t)) <> ")"
-                   <> fieldValues (length $ tableFields t)) (join $ fmap (tableToRow t) vals)
+                   <> fieldValues (length $ tableFields t)) (join $ fmap (tableEncoder t) vals)
 
