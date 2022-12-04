@@ -36,15 +36,14 @@ import           Transient.Core
 import           Transient.Internal.Backend
 import           Transient.Internal.SqlDialect
 
+import           Data.Data                     (Data, constrFields,
+                                                dataTypeName, dataTypeOf,
+                                                indexConstr)
+import           Data.Int                      (Int64)
 import           Data.Proxy                    (Proxy (..))
 import           GHC.OverloadedLabels          (IsLabel (..))
-import           GHC.Records                   (HasField)
+import           GHC.Records                   (HasField (..))
 import           GHC.TypeLits                  (KnownSymbol, symbolVal)
-
-
--- Imports for Test
-import           Data.Int                      (Int64)
-import           Data.Void                     (Void, absurd)
 
 type QueryFragment = SqlDialect -> (BSB.Builder, [SqlValue])
 
@@ -167,10 +166,14 @@ instance Applicative AliasedReference where
             , aliasedValue = aliasedValue f <*> aliasedValue a
             }
 
-class AsAliasedReference a where
-    alias_ :: a -> SqlQuery (AliasedReference a)
+class AsAliasedReference a r | a -> r where
+    alias_ :: a -> SqlQuery (AliasedReference r)
 
-instance AsAliasedReference (SqlExpr n a) where
+instance AsAliasedReference (AliasedReference a) a where
+    alias_ = pure
+instance Data a => AsAliasedReference (SqlSelect a) (SqlRecord NotNullable a) where
+    alias_ = mkSqlRecord
+instance AsAliasedReference (SqlExpr n a) (SqlExpr n a) where
     alias_ = sqlExprAliasedReference
 
 sqlExprAliasedReference :: SqlExpr n a -> SqlQuery (AliasedReference (SqlExpr n a))
@@ -187,7 +190,7 @@ sqlExprAliasedReference expr = do
             }
         }
 
-instance AsAliasedReference (SqlRecord n a) where
+instance AsAliasedReference (SqlRecord n a) (SqlRecord n a) where
     alias_ = sqlRecordAliasedReference
 
 sqlRecordAliasedReference :: SqlRecord n a -> SqlQuery (AliasedReference (SqlRecord n a))
@@ -210,7 +213,7 @@ sqlRecordAliasedReference record = do
                 }
         }
 
-instance (AsAliasedReference a, AsAliasedReference b) => AsAliasedReference (a :& b) where
+instance (AsAliasedReference a a', AsAliasedReference b b') => AsAliasedReference (a :& b) (a' :& b') where
     alias_ (a :& b) = do
         a' <- alias_ a
         b' <- alias_ b
@@ -404,14 +407,38 @@ table_ model = From $ do
              }
          )
 
-instance AsAliasedReference a => AsFrom (SqlQuery a) a where
-    asFrom = subquery_
+mkSqlRecord :: forall rec. Data rec => SqlSelect rec -> SqlQuery (AliasedReference (SqlRecord NotNullable rec))
+mkSqlRecord sqlSelect = do
+    let recordType = dataTypeOf (undefined :: rec)
+    v <- freshIdent (C8.pack $ dataTypeName recordType)
+    let recordFields = constrFields $ indexConstr recordType 1
+        prefixedFieldName fieldName = v <> "_" <> (unsafeIdentFromString $ C8.pack fieldName)
+        aliasedIdents = fmap prefixedFieldName recordFields
+        fieldMap = Map.fromList $ zip recordFields aliasedIdents
+        renderAliasedSelect fragment aliasIdent =
+            \d -> fragment d <> (" AS " <> renderIdent d aliasIdent, [])
+    pure $ AliasedReference
+        { aliasedSelectQueryFragment =
+            fmap (uncurry renderAliasedSelect) $
+            zip (sqlSelectQueryFragments sqlSelect) aliasedIdents
+        , aliasedValue  = \queryIdent ->
+            SqlRecord
+                { sqlRecordFields = NE.fromList aliasedIdents
+                , sqlRecordFieldMap = fieldMap
+                , sqlRecordDecoder = sqlSelectDecoder sqlSelect
+                , sqlRecordBaseIdent = queryIdent
+                }
+        }
 
-subquery_ :: AsAliasedReference a => SqlQuery a -> From a
+
+instance AsAliasedReference a a' => AsFrom (SqlQuery a) a' where
+    asFrom = subquery_ . (alias_ =<<)
+
+subquery_ :: SqlQuery (AliasedReference a) -> From a
 subquery_ query = From $ do
     queryState <- SqlQuery get
     SqlQuery $ put $ queryState{ sqsQueryParts = mempty }
-    ref <- alias_ =<< query
+    ref <- query
     subqueryState <- SqlQuery get
     SqlQuery $ put queryState{ sqsIdentifierMap = sqsIdentifierMap subqueryState }
     subqueryIdent <- freshIdent "q"

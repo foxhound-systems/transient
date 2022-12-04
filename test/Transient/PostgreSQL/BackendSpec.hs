@@ -33,6 +33,11 @@ data Test = Test
     , testBool :: Maybe Bool
     } deriving (Show, Eq, Data)
 
+data DTOTest = DTOTest
+    { dtoField1 :: Int64
+    , dtoField2 :: Int64
+    } deriving (Show, Eq, Data)
+
 testT :: Table NewTest Test
 testT = table "test" $ Test
             <$> field newTestId ("id" serial)
@@ -111,3 +116,16 @@ spec = withTable $ inTransaction $ do
        x `shouldBe` [ (Test 1 84 Nothing :& 1), (Test 1 84 Nothing :& 2)
                     , (Test 2 24 Nothing :& 1), (Test 2 24 Nothing :& 2)
                     ]
+
+   it "can use custom dtos" $ \conn -> do
+       i <- insertMany conn testT [ NewTest (Just 1) 84 Nothing, NewTest (Just 2) 24 Nothing ]
+       x <- runSelectMany conn do
+                r <- from do
+                       t <- from testT
+                       select $
+                        DTOTest
+                            <$> select_ (t ^. #testId)
+                            <*> select_ (t ^. #testTest)
+                select (r :& r ^. #dtoField1)
+       x `shouldBe` [ (DTOTest 1 84 :& 1), (DTOTest 2 24 :& 2) ]
+
