@@ -1,5 +1,11 @@
-{-# LANGUAGE BlockArguments    #-}
-{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE BlockArguments        #-}
+{-# LANGUAGE DataKinds             #-}
+{-# LANGUAGE DeriveDataTypeable    #-}
+{-# LANGUAGE FlexibleInstances     #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE OverloadedLabels      #-}
+{-# LANGUAGE OverloadedStrings     #-}
+
 module Transient.PostgreSQL.BackendSpec
     where
 
@@ -13,6 +19,7 @@ import           Transient.Internal.SqlValue
 import           Transient.SqlQuery
 
 import qualified Data.ByteString             as BS
+import           Data.Data                   (Data)
 import           Data.Int                    (Int64)
 
 data NewTest = NewTest
@@ -24,22 +31,13 @@ data Test = Test
     { testId   :: Int64
     , testTest :: Int64
     , testBool :: Maybe Bool
-    } deriving (Show, Eq)
-
-testIdF :: EntityField Test (Maybe Int64) Int64
-testIdF = "id" serial
-
-testTestF :: SimpleField Test Int64
-testTestF = "test"
-
-testBoolF :: SimpleField Test (Maybe Bool)
-testBoolF = "bool_field"
+    } deriving (Show, Eq, Data)
 
 testT :: Table NewTest Test
 testT = table "test" $ Test
-            <$> field newTestId testIdF
-            <*> field newTestTest testTestF
-            <*> field newTestBool testBoolF
+            <$> field newTestId ("id" serial)
+            <*> field newTestTest "test"
+            <*> field newTestBool "bool"
 
 inTransaction :: SpecWith Backend -> SpecWith Backend
 inTransaction =
@@ -66,7 +64,7 @@ spec = withTable $ inTransaction $ do
        i `shouldBe` 2
        x <- runSelectUnique conn do
                t <- from testT
-               where_ $ t ^. testTestF ==. val 42
+               where_ $ t ^. #testTest ==. val 42
                select t
        x `shouldBe` Just (Test 1 42 Nothing)
 
@@ -81,16 +79,16 @@ spec = withTable $ inTransaction $ do
                               & innerJoin_ testT
                                 `on_` do
                                     \(t :& t2) ->
-                                        t ^. testIdF ==. t2 ^. testIdF
+                                        t ^. #testId ==. t2 ^. #testId
                           `on_` do
                             \(t :& (_ :& t3)) ->
-                                t /=. t3
+                                t ^. #testId /=. t3 ^. #testId
                         & leftJoin_ testT
                           `on_` \(t :& _ :& t4) ->
-                             t ^. testIdF /=. t ^. testIdF
-                where_ $ t ^. testIdF ==. val 1
-                select (t ^. testTestF :& t2 ?. testTestF)
-       x `shouldBe` [(84 :& Just 24)]
+                             t ^. #testId /=. t ^. #testId
+                where_ $ t ^. #testId ==. val 1
+                select (t ^. #testTest :& t2 ?. #testTest)
+       x `shouldBe` [84 :& Just 24]
 
    it "can insert into" $ \conn -> do
        i <- insertInto conn testT do
@@ -106,10 +104,10 @@ spec = withTable $ inTransaction $ do
    it "can do subqueries" $ \conn -> do
        i <- insertMany conn testT [ NewTest (Just 1) 84 Nothing, NewTest (Just 2) 24 Nothing ]
        x <- runSelectMany conn do
-                r <- from (alias_ =<<
-                            (from $ do
-                                t <- from $ table_ testT
-                                alias_ t))
-                select (r :& r ^. testIdF)
-       x `shouldBe` [(Test 1 84 Nothing :& 1), (Test 2 24 Nothing :& 2)]
-
+                (r :& r2) <- from $
+                     from $
+                     from (table_ testT & crossJoin_ testT)
+                select (r :& r2 ^. #testId)
+       x `shouldBe` [ (Test 1 84 Nothing :& 1), (Test 1 84 Nothing :& 2)
+                    , (Test 2 24 Nothing :& 1), (Test 2 24 Nothing :& 2)
+                    ]

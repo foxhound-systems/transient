@@ -5,7 +5,10 @@
 {-# LANGUAGE FunctionalDependencies     #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE LambdaCase                 #-}
+{-# LANGUAGE OverloadedLabels           #-}
 {-# LANGUAGE OverloadedStrings          #-}
+{-# LANGUAGE ScopedTypeVariables        #-}
+{-# LANGUAGE TypeApplications           #-}
 {-# LANGUAGE TypeOperators              #-}
 {-# LANGUAGE UndecidableInstances       #-}
 
@@ -16,6 +19,7 @@ import           Control.Monad                 (join)
 import           Control.Monad.State           (State, get, put, runState)
 import qualified Data.ByteString               as BS
 import qualified Data.ByteString.Builder       as BSB
+import qualified Data.ByteString.Char8         as C8
 import qualified Data.ByteString.Lazy          as BSL
 import           Data.Foldable                 (fold, foldl')
 import           Data.Function                 ((&))
@@ -24,12 +28,18 @@ import           Data.List.NonEmpty            (NonEmpty)
 import qualified Data.List.NonEmpty            as NE
 import           Data.Map                      (Map)
 import qualified Data.Map                      as Map
-import           Data.Maybe                    (listToMaybe, mapMaybe)
+import           Data.Maybe                    (fromMaybe, listToMaybe,
+                                                mapMaybe)
 import           Data.String                   (IsString (..))
 
 import           Transient.Core
 import           Transient.Internal.Backend
 import           Transient.Internal.SqlDialect
+
+import           Data.Proxy                    (Proxy (..))
+import           GHC.OverloadedLabels          (IsLabel (..))
+import           GHC.Records                   (HasField)
+import           GHC.TypeLits                  (KnownSymbol, symbolVal)
 
 
 -- Imports for Test
@@ -43,76 +53,26 @@ instance IsString (BSB.Builder, [SqlValue]) where
 
 data Nullable
 data NotNullable
-type SqlExpr a = SqlExpr' NotNullable a
-data SqlExpr' nullable a = SqlExpr
-    { sqlExprKind    :: SqlExprKind
-    , sqlExprDecoder :: Decoder a
+data SqlExpr nullable a = SqlExpr
+    { sqlExprFragment  :: QueryFragment
     } deriving Functor
 
-sqlExprSelect :: SqlExpr' nullable a -> SqlSelect a
-sqlExprSelect expr =
-  SqlSelect
-    { sqlSelectDecoder = sqlExprDecoder expr
-    , sqlSelectQueryFragments = NE.toList $ sqlExprMultiFragment expr
+veryUnsafeCoerceSqlExpr :: SqlExpr n a -> SqlExpr n' a'
+veryUnsafeCoerceSqlExpr (SqlExpr f) = SqlExpr f
+
+data SqlRecord nullable a = SqlRecord
+    { sqlRecordFieldMap  :: Map String Ident
+    , sqlRecordDecoder   :: Decoder a
+    , sqlRecordBaseIdent :: Ident
+    , sqlRecordFields    :: NonEmpty Ident
     }
 
-data SqlExprKind = SqlExprKind
-    { sqlExprKindFragments     :: NonEmpty QueryFragment
-    , sqlExprKindAliased       :: Ident -> Ident -> SqlExprKind
-    , sqlExprKindAliasedSelect :: Ident -> [QueryFragment]
-    , sqlExprKindProjectField  :: Ident -> QueryFragment
-    }
+veryUnsafeCoerceSqlRecord :: SqlRecord n a -> SqlRecord n' a
+veryUnsafeCoerceSqlRecord (SqlRecord a b c d) = SqlRecord a b c d
 
 renderQualifiedName :: Ident -> Ident -> QueryFragment
 renderQualifiedName baseIdent ident d =
     (renderIdent d baseIdent <> "." <> renderIdent d ident, [])
-
-valueExpression :: QueryFragment -> SqlExprKind
-valueExpression frag =
-    SqlExprKind
-        { sqlExprKindFragments = NE.singleton frag
-        , sqlExprKindAliased = \subqueryIdent aliasIdent ->
-            valueExpression (renderQualifiedName subqueryIdent aliasIdent)
-        , sqlExprKindAliasedSelect = \aliasIdent ->
-            [\d -> frag d <> " AS " <> (renderIdent d aliasIdent, [])]
-        , sqlExprKindProjectField = \_ -> frag
-        }
-
-tableExpression :: Ident -> NonEmpty Ident -> SqlExprKind
-tableExpression tableIdent fieldIdents =
-    SqlExprKind
-        { sqlExprKindFragments = fmap (renderQualifiedName tableIdent) fieldIdents
-        , sqlExprKindAliased = \subqueryIdent aliasIdent ->
-            aliasedTableReference subqueryIdent aliasIdent fieldIdents
-        , sqlExprKindAliasedSelect = \aliasIdent ->
-            NE.toList $ fmap (\field d ->
-                (renderQualifiedName tableIdent field d
-                 <> " AS " <> (renderIdent d (aliasIdent <> "_" <> field), []))) fieldIdents
-        , sqlExprKindProjectField = renderQualifiedName tableIdent
-        }
-
-aliasedTableReference :: Ident -> Ident -> NonEmpty Ident -> SqlExprKind
-aliasedTableReference subqueryIdent aliasIdent fieldIdents =
-    let aliasField field = aliasIdent <> "_" <> field
-    in SqlExprKind
-        { sqlExprKindFragments = fmap (renderQualifiedName subqueryIdent . aliasField) fieldIdents
-        , sqlExprKindAliased = \subqueryIdent' aliasIdent' ->
-            aliasedTableReference subqueryIdent' aliasIdent' fieldIdents
-        , sqlExprKindAliasedSelect = \newAliasIdent ->
-            NE.toList $ fmap (\field d ->
-                (renderQualifiedName subqueryIdent (aliasField field) d
-                 <> " AS " <> (renderIdent d (newAliasIdent <> "_" <> field), []))) fieldIdents
-        , sqlExprKindProjectField = \fieldIdent ->
-            renderQualifiedName subqueryIdent (aliasIdent <> "_" <> fieldIdent)
-        }
-
-sqlExprFragment :: SqlExpr' n a -> QueryFragment
-sqlExprFragment expr =
-    NE.head $ sqlExprMultiFragment expr
-
-sqlExprMultiFragment :: SqlExpr' n a -> NonEmpty QueryFragment
-sqlExprMultiFragment expr =
-    sqlExprKindFragments $ sqlExprKind expr
 
 newtype From a = From
     { unFrom :: SqlQuery (QueryFragment, a) }
@@ -210,17 +170,45 @@ instance Applicative AliasedReference where
 class AsAliasedReference a where
     alias_ :: a -> SqlQuery (AliasedReference a)
 
-instance AsAliasedReference (SqlExpr' n a) where
-    alias_ expr = do
-        aliasIdent <- freshIdent "v"
-        pure $ AliasedReference
-            { aliasedValue = \subqueryIdent ->
-                SqlExpr
-                    { sqlExprDecoder = sqlExprDecoder expr
-                    , sqlExprKind = sqlExprKindAliased (sqlExprKind expr) subqueryIdent aliasIdent
-                    }
-            , aliasedSelectQueryFragment = sqlExprKindAliasedSelect (sqlExprKind expr) aliasIdent
+instance AsAliasedReference (SqlExpr n a) where
+    alias_ = sqlExprAliasedReference
+
+sqlExprAliasedReference :: SqlExpr n a -> SqlQuery (AliasedReference (SqlExpr n a))
+sqlExprAliasedReference expr = do
+    valueIdent <- freshIdent "v"
+    pure $ AliasedReference
+        { aliasedSelectQueryFragment =
+            [ \d ->
+                sqlExprFragment expr d <> " AS " <> (renderIdent d valueIdent, [])
+            ]
+        , aliasedValue = \subqueryIdent ->
+            SqlExpr{
+                sqlExprFragment = renderQualifiedName subqueryIdent valueIdent
             }
+        }
+
+instance AsAliasedReference (SqlRecord n a) where
+    alias_ = sqlRecordAliasedReference
+
+sqlRecordAliasedReference :: SqlRecord n a -> SqlQuery (AliasedReference (SqlRecord n a))
+sqlRecordAliasedReference record = do
+    let prefixedFieldIdent fieldIdent = sqlRecordBaseIdent record <> "_" <> fieldIdent
+        aliasedFieldIdents = fmap prefixedFieldIdent (sqlRecordFields record)
+        aliasedFieldMap = fmap prefixedFieldIdent (sqlRecordFieldMap record)
+        renderField fieldIdent = \d ->
+            renderQualifiedName (sqlRecordBaseIdent record) fieldIdent d
+            <> " AS "
+            <> (renderIdent d (prefixedFieldIdent fieldIdent), [])
+    pure $ AliasedReference
+        { aliasedSelectQueryFragment =
+            NE.toList $ fmap renderField $ sqlRecordFields record
+        , aliasedValue = \subqueryIdent ->
+            record
+                { sqlRecordFields = aliasedFieldIdents
+                , sqlRecordFieldMap = aliasedFieldMap
+                , sqlRecordBaseIdent = subqueryIdent
+                }
+        }
 
 instance (AsAliasedReference a, AsAliasedReference b) => AsAliasedReference (a :& b) where
     alias_ (a :& b) = do
@@ -249,13 +237,56 @@ class AsSelect a r | a -> r where
     select_ :: a -> SqlSelect r
 instance AsSelect (SqlSelect a) a where
     select_ = id
-instance AsSelect (SqlExpr' NotNullable a) a where
-    select_ = sqlExprSelect
-instance AsSelect (SqlExpr' Nullable a) (Maybe a) where
-    select_ = nullableSqlSelect . sqlExprSelect
+instance AsSelect (SqlRecord NotNullable a) a where
+    select_ = selectRecord
+instance AutoType a => AsSelect (SqlExpr NotNullable a) a where
+    select_ expr = select_ (expr, auto @a)
+instance AutoType a => AsSelect (SqlExpr Nullable a) (Maybe a) where
+    select_ expr = select_ (expr, auto @a)
+instance AsSelect (SqlExpr NotNullable a, SqlType' x a) a where
+    select_ = uncurry selectValue
+instance AsSelect (SqlRecord Nullable a) (Maybe a) where
+    select_ = selectRecordMaybe
+instance AsSelect (SqlExpr Nullable a, SqlType' x a) (Maybe a) where
+    select_ = uncurry selectValueMaybe
 instance (AsSelect a ar, AsSelect b br) => AsSelect (a :& b) (ar :& br) where
     select_ (a :& b) =
         (:&) <$> select_ a <*> select_ b
+
+infixr 9 `asType`
+asType :: SqlExpr n a -> SqlType' x a -> (SqlExpr n a, SqlType' x a)
+asType = (,)
+
+selectRecordUnsafe :: SqlRecord n a -> SqlSelect a
+selectRecordUnsafe sqlRecord =
+    let renderField = renderQualifiedName (sqlRecordBaseIdent sqlRecord)
+    in SqlSelect
+        { sqlSelectQueryFragments = NE.toList $ fmap renderField $ sqlRecordFields sqlRecord
+        , sqlSelectDecoder = sqlRecordDecoder sqlRecord
+        }
+
+selectRecord :: SqlRecord NotNullable a -> SqlSelect a
+selectRecord = selectRecordUnsafe
+
+selectRecordMaybe :: SqlRecord Nullable a -> SqlSelect (Maybe a)
+selectRecordMaybe sqlRecord =
+    nullableSqlSelect $ selectRecordUnsafe sqlRecord
+
+selectValueUnsafe :: SqlExpr n a -> SqlType' x a -> SqlSelect a
+selectValueUnsafe expr sqlType =
+    SqlSelect
+        { sqlSelectQueryFragments = [sqlExprFragment expr]
+        , sqlSelectDecoder = \case
+            val:rest -> fmap (\parsedVal -> (parsedVal,rest)) $ fromSqlType sqlType val
+            _        -> Nothing
+        }
+
+selectValue :: SqlExpr NotNullable a -> SqlType' x a -> SqlSelect a
+selectValue = selectValueUnsafe
+
+selectValueMaybe :: SqlExpr Nullable a -> SqlType' x a -> SqlSelect (Maybe a)
+selectValueMaybe expr sqlType =
+    nullableSqlSelect $ selectValueUnsafe expr sqlType
 
 type SelectQuery r = SqlQuery (SqlSelect r)
 
@@ -305,115 +336,82 @@ writeQueryData queryData =
         sqs <- get
         put $ sqs{ sqsQueryParts = sqsQueryParts sqs <> queryData }
 
-where_ :: SqlExpr' NotNullable Bool -> SqlQuery ()
+where_ :: SqlExpr NotNullable Bool -> SqlQuery ()
 where_ expr =
     writeQueryData mempty{sqlQueryDataWhereClause = Just [sqlExprFragment expr]}
 
-simpleExpr :: QueryFragment -> Decoder a -> SqlExpr' n a
-simpleExpr frag fromRow =
-    SqlExpr
-        { sqlExprDecoder = fromRow
-        , sqlExprKind = valueExpression frag
-        }
-
-binOp :: BSB.Builder -> BSB.Builder -> Decoder c -> SqlExpr' n a -> SqlExpr' n b -> SqlExpr' n c
-binOp op connect fromRow lhs rhs =
-    let applyOp :: QueryFragment -> QueryFragment -> QueryFragment
-        applyOp l r = \d -> l d <> (" " <> op <> " ", []) <> r d
-        frag = fold $
-               NE.intersperse (const (" " <> connect <> " ", [])) $
-               fmap (uncurry applyOp) $
-               NE.zip (sqlExprMultiFragment lhs) (sqlExprMultiFragment rhs)
-    in simpleExpr frag fromRow
-
-boolFromRow :: Decoder Bool
-boolFromRow = fieldParser auto
+binOp :: BSB.Builder -> SqlExpr n a -> SqlExpr n b -> SqlExpr n c
+binOp op lhs rhs =
+    SqlExpr $ \d ->
+        sqlExprFragment lhs d <> (" " <> op <> " ", []) <> sqlExprFragment rhs d
 
 infixr 6 ==., /=.
-(==.) :: SqlExpr' n a -> SqlExpr' n a -> SqlExpr' n Bool
-(==.) = binOp "=" "AND" boolFromRow
-(/=.) :: SqlExpr' n a -> SqlExpr' n a -> SqlExpr' n Bool
-(/=.) = binOp "!=" "OR" boolFromRow
+(==.) :: SqlExpr n a -> SqlExpr n a -> SqlExpr n Bool
+(==.) = binOp "="
+(/=.) :: SqlExpr n a -> SqlExpr n a -> SqlExpr n Bool
+(/=.) = binOp "!="
 
 infix 4 `and_`, `or_`
-and_ :: SqlExpr' n Bool -> SqlExpr' n Bool -> SqlExpr' n Bool
-and_ = binOp "AND" "AND" boolFromRow
-or_ :: SqlExpr' n Bool -> SqlExpr' n Bool -> SqlExpr' n Bool
-or_ = binOp "OR" "OR" boolFromRow
+and_ :: SqlExpr n Bool -> SqlExpr n Bool -> SqlExpr n Bool
+and_ = binOp "AND"
+or_ :: SqlExpr n Bool -> SqlExpr n Bool -> SqlExpr n Bool
+or_ = binOp "OR"
 
-isNull_ :: SqlExpr' Nullable a -> SqlExpr' n Bool
+isNull_ :: SqlExpr Nullable a -> SqlExpr n Bool
 isNull_ expr =
-    let frag = fold $
-               NE.intersperse (const " AND ") $
-               fmap (<> const " IS NULL") $
-               sqlExprMultiFragment expr
-    in simpleExpr frag boolFromRow
+    SqlExpr $ \d ->
+        sqlExprFragment expr d <> " IS NULL"
 
-isNotNull_ :: SqlExpr' Nullable a -> SqlExpr' NotNullable Bool
+isNotNull_ :: SqlExpr Nullable a -> SqlExpr NotNullable Bool
 isNotNull_ expr =
-    let frag = fold $
-               NE.intersperse (const " OR ") $
-               fmap (<> const " IS NOT NULL") $
-               sqlExprMultiFragment expr
-    in simpleExpr frag boolFromRow
+    SqlExpr $ \d ->
+        sqlExprFragment expr d <> " IS NOT NULL"
 
-val :: AutoType i => i -> SqlExpr' NotNullable i
+val :: AutoType i => i -> SqlExpr NotNullable i
 val x = valOfType x auto
 
-valOfType :: i -> SqlType' i o -> SqlExpr' NotNullable o
+valOfType :: a -> SqlType' a x -> SqlExpr NotNullable a
 valOfType x sqlType =
     let v = case toSqlType sqlType x of
                 SqlDefault -> SqlNull -- Default should only be used by insert many
                 x          -> x
-    in simpleExpr (const ("?", [v])) (fieldParser sqlType)
+    in SqlExpr (const ("?", [v]))
 
-just_ :: SqlExpr' n a -> SqlExpr' Nullable a
-just_ expr =
-    SqlExpr
-        { sqlExprKind = sqlExprKind expr
-        , sqlExprDecoder = sqlExprDecoder expr
-        }
+just_ :: SqlExpr n a -> SqlExpr Nullable a
+just_  = veryUnsafeCoerceSqlExpr
 
-nullable_ :: SqlExpr' n (Maybe a) -> SqlExpr' Nullable a
-nullable_ expr =
-    SqlExpr
-        { sqlExprKind = sqlExprKind expr
-        , sqlExprDecoder = \values -> do
-            (Just res, rest) <- sqlExprDecoder expr values
-            pure (res, rest)
-        }
+nullable_ :: SqlExpr n (Maybe a) -> SqlExpr Nullable a
+nullable_ = veryUnsafeCoerceSqlExpr
 
-instance AsFrom (Table i r) (SqlExpr' NotNullable r) where
+instance AsFrom (Table i r) (SqlRecord NotNullable r) where
     asFrom = table_
 
-table_ :: Table x r -> From (SqlExpr' NotNullable r)
+table_ :: Table x r -> From (SqlRecord NotNullable r)
 table_ model = From $ do
     ident <- freshIdent (tableName model)
     let originalTableIdent = unsafeIdentFromString (tableName model)
         fromFragment = if ident == originalTableIdent
                           then \d -> (renderIdent d ident, [])
                           else \d -> (renderIdent d originalTableIdent <> " AS " <> renderIdent d ident, [])
-        fieldIdent field =
-            unsafeIdentFromString (fieldName field)
-        qualifiedFieldFrag field d =
-            (renderIdent d ident <> "." <> renderIdent d (fieldIdent field), [])
+        fieldIdent field = unsafeIdentFromString (fieldName field)
         unqualifiedFields = fmap fieldIdent $ tableFields model
-        qualifiedFields = fmap qualifiedFieldFrag $ tableFields model
     pure ( fromFragment
-         , SqlExpr
-            { sqlExprKind = tableExpression ident (NE.fromList unqualifiedFields)
-            , sqlExprDecoder = tableDecoder model
-            }
+         , SqlRecord
+             { sqlRecordFieldMap = fmap unsafeIdentFromString (tableFieldMap model)
+             , sqlRecordDecoder = tableDecoder model
+             , sqlRecordBaseIdent = ident
+             , sqlRecordFields = NE.fromList unqualifiedFields
+             }
          )
 
-instance AsFrom (SqlQuery (AliasedReference a)) a where
+instance AsAliasedReference a => AsFrom (SqlQuery a) a where
     asFrom = subquery_
 
-subquery_ :: SqlQuery (AliasedReference a) -> From a
+subquery_ :: AsAliasedReference a => SqlQuery a -> From a
 subquery_ query = From $ do
     queryState <- SqlQuery get
     SqlQuery $ put $ queryState{ sqsQueryParts = mempty }
-    ref <- query
+    ref <- alias_ =<< query
     subqueryState <- SqlQuery get
     SqlQuery $ put queryState{ sqsIdentifierMap = sqsIdentifierMap subqueryState }
     subqueryIdent <- freshIdent "q"
@@ -424,7 +422,7 @@ subquery_ query = From $ do
          , aliasedValue ref subqueryIdent
          )
 
-type OnClause a = a -> SqlExpr' NotNullable Bool
+type OnClause a = a -> SqlExpr NotNullable Bool
 
 infix 9 `on_`
 on_ :: (OnClause a -> b) -> OnClause a -> b
@@ -437,8 +435,10 @@ infixl 2 :&
 class ToMaybe arg result | arg -> result where
     toMaybe :: arg -> result
 
-instance ToMaybe (SqlExpr' n a) (SqlExpr' Nullable a) where
+instance ToMaybe (SqlExpr n a) (SqlExpr Nullable a) where
     toMaybe = just_
+instance ToMaybe (SqlRecord n a) (SqlRecord Nullable a) where
+    toMaybe = veryUnsafeCoerceSqlRecord
 
 instance (ToMaybe a a', ToMaybe b b') => ToMaybe (a :& b) (a' :& b') where
     toMaybe (a :& b) = toMaybe a :& toMaybe b
@@ -460,24 +460,37 @@ joinHelper joinType toRes joinFrom onClause baseFrom = From do
 innerJoin_ :: (AsFrom fa a, AsFrom fb b) => Join fa a fb b (a :& b)
 innerJoin_ = joinHelper "INNER JOIN" (:&)
 
+crossJoin_ :: (AsFrom fa a, AsFrom fb b) => fb -> fa -> From (a :& b)
+crossJoin_ joinFrom baseFrom = From do
+    (baseFromFragment, baseExpr) <- unFrom $ asFrom baseFrom
+    (joinFromFragment, joinExpr) <- unFrom $ asFrom joinFrom
+    pure ( \d -> baseFromFragment d <> " CROSS JOIN " <> joinFromFragment d
+         , baseExpr :& joinExpr
+         )
+
 leftJoin_ :: (AsFrom fa a, AsFrom fb b, ToMaybe b mb) => Join fa a fb b (a :& mb)
 leftJoin_ = joinHelper "LEFT JOIN" (\a b -> a :& toMaybe b)
 
 infixr 9 ^., ?., ??.
-(^.) :: SqlExpr rec -> EntityField rec i o -> SqlExpr o
-(^.) = projectField
+(^.) :: SqlRecord NotNullable rec -> FieldSelector rec o -> SqlExpr NotNullable o
+(^.) ent field = projectField ent (fieldSelectorName field)
 
-(?.) :: SqlExpr' Nullable rec -> EntityField rec i o -> SqlExpr' Nullable o
-(?.) = projectField
+(?.) :: SqlRecord Nullable rec -> FieldSelector rec o -> SqlExpr Nullable o
+(?.) ent field = projectField ent (fieldSelectorName field)
 
-(??.) :: SqlExpr' Nullable rec -> EntityField rec i (Maybe o) -> SqlExpr' Nullable o
+(??.) :: SqlRecord Nullable rec -> FieldSelector rec (Maybe o) -> SqlExpr Nullable o
 (??.) ent field = nullable_ $ ent ?. field
 
-projectField :: SqlExpr' n a -> EntityField b c d -> SqlExpr' n' d
-projectField ent (EntityField name sqlType) =
-    let nameIdent = unsafeIdentFromString name
-        frag = sqlExprKindProjectField (sqlExprKind ent) nameIdent
-    in simpleExpr frag (fieldParser sqlType)
+data FieldSelector rec a = FieldSelector
+    { fieldSelectorName :: String }
+
+instance (KnownSymbol field, HasField field rec res) => IsLabel field (FieldSelector rec res) where
+    fromLabel = FieldSelector $ symbolVal (Proxy :: Proxy field)
+
+projectField :: SqlRecord n a -> String -> SqlExpr n' d
+projectField ent name =
+    let nameIdent = fromMaybe (unsafeIdentFromString (C8.pack name)) $ Map.lookup name (sqlRecordFieldMap ent)
+    in SqlExpr $ renderQualifiedName (sqlRecordBaseIdent ent) nameIdent
 
 insertInto :: Backend -> Table w r -> SelectQuery r -> IO Int64
 insertInto conn t q =

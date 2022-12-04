@@ -1,7 +1,14 @@
-{-# LANGUAGE DeriveFunctor     #-}
-{-# LANGUAGE FlexibleInstances #-}
-{-# LANGUAGE LambdaCase        #-}
-{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE AllowAmbiguousTypes    #-}
+{-# LANGUAGE DataKinds              #-}
+{-# LANGUAGE DeriveFunctor          #-}
+{-# LANGUAGE FlexibleInstances      #-}
+{-# LANGUAGE FunctionalDependencies #-}
+{-# LANGUAGE KindSignatures         #-}
+{-# LANGUAGE LambdaCase             #-}
+{-# LANGUAGE OverloadedStrings      #-}
+{-# LANGUAGE ScopedTypeVariables    #-}
+{-# LANGUAGE TypeApplications       #-}
+{-# LANGUAGE UndecidableInstances   #-}
 
 module Transient.Core
     ( SqlValue(..)
@@ -13,12 +20,18 @@ module Transient.Core
 
 import           Control.Monad               (join)
 import qualified Data.ByteString             as BS
+import           Data.Data                   (Data, constrFields, dataTypeOf,
+                                              indexConstr)
 import           Data.Int                    (Int64)
 import qualified Data.List                   as List
+import           Data.Map.Strict             (Map)
+import qualified Data.Map.Strict             as Map
 import           Data.String                 (IsString (..))
 import qualified Data.Text                   as T
 import           Data.Time.Clock             (UTCTime)
 import           Data.Void                   (Void, absurd)
+import           GHC.OverloadedLabels
+import           GHC.TypeLits                (Symbol, symbolVal)
 
 import           Transient.Internal.Backend
 import           Transient.Internal.SqlType
@@ -142,19 +155,20 @@ data FieldDef = FieldDef
     } deriving Show
 
 data Table i o = Table
-    { tableEncoder :: Encoder i
-    , tableDecoder :: Decoder o
-    , tableName    :: BS.ByteString
-    , tableFields  :: [FieldDef]
+    { tableEncoder  :: Encoder i
+    , tableDecoder  :: Decoder o
+    , tableName     :: BS.ByteString
+    , tableFields   :: [FieldDef]
+    , tableFieldMap :: Map String BS.ByteString
     }
 
-data Fields i o = Fields
+data Fields x i o = Fields
     { fieldsEncoder   :: Encoder i
     , fieldsDecoder   :: Decoder o
     , fieldsFieldDefs :: [FieldDef]
     } deriving Functor
 
-instance Applicative (Fields i) where
+instance Applicative (Fields x i) where
     pure a = Fields
         { fieldsDecoder = \vs -> Just (a, vs)
         , fieldsEncoder = \_ -> []
@@ -170,19 +184,30 @@ instance Applicative (Fields i) where
         , fieldsFieldDefs = fieldsFieldDefs a <> fieldsFieldDefs b
         }
 
-table :: BS.ByteString -> Fields i o -> Table i o
+table :: forall o i. Data o => BS.ByteString -> Fields o i o -> Table i o
 table tableName fields =
+    let tableType = dataTypeOf (undefined :: o)
+        recordFields = constrFields $ indexConstr tableType 1
+        fieldMap = Map.fromList $ zip recordFields (fmap fieldName $ fieldsFieldDefs fields)
+    in
     Table
         { tableEncoder = fieldsEncoder fields
         , tableDecoder = fieldsDecoder fields
         , tableFields = fieldsFieldDefs fields
         , tableName = tableName
+        , tableFieldMap = fieldMap
         }
 
 data EntityField ent i o = EntityField
     { entityFieldName :: BS.ByteString
     , entityFieldType :: SqlType' i o
     }
+
+class SqlField (field :: Symbol) entity input output | entity field -> input output where
+    fieldDescriptor :: EntityField entity input output
+
+instance SqlField field entity input output => IsLabel field (EntityField entity input output) where
+    fromLabel = fieldDescriptor @field
 
 type SimpleField rec a = EntityField rec a a
 instance AutoType t => IsString (EntityField r t t) where
@@ -195,7 +220,7 @@ fieldDef :: EntityField x i o -> FieldDef
 fieldDef (EntityField fieldName t) =
     FieldDef fieldName (sqlType t) (sqlTypeConstraints t)
 
-field :: (rec -> i) -> EntityField x i o -> Fields rec o
+field :: (rec -> i) -> EntityField x i o -> Fields x rec o
 field fromRec f@(EntityField _ t) =
     Fields
         { fieldsFieldDefs = [fieldDef f]
