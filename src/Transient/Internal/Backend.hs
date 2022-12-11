@@ -6,10 +6,10 @@ import           Data.Int                      (Int64)
 import           Transient.Internal.SqlDialect
 import           Transient.Internal.SqlValue
 
-data Backend = Backend
+data Backend be = Backend
     { connTag     :: BS.ByteString
     , connDialect :: SqlDialect
-    , connQuery   :: BS.ByteString -> [SqlValue] -> IO [[SqlValue]]
-    , connExecute :: BS.ByteString -> [SqlValue] -> IO Int64
+    , connQuery   :: BS.ByteString -> [SqlValue be] -> IO [[SqlValue be]]
+    , connExecute :: BS.ByteString -> [SqlValue be] -> IO Int64
     , connClose   :: IO ()
     }

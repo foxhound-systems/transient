@@ -5,46 +5,49 @@
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE OverloadedLabels      #-}
 {-# LANGUAGE OverloadedStrings     #-}
+{-# LANGUAGE OverloadedRecordDot   #-}
+{-# LANGUAGE DuplicateRecordFields #-}
 
 module Transient.PostgreSQL.BackendSpec
     where
 
-import           Control.Exception           (bracket)
-import           Control.Monad               (join)
-import           Data.Function               ((&))
+import           Control.Exception            (bracket)
+import           Control.Monad                (join)
+import           Data.Function                ((&))
 import           Test.Hspec
 import           Transient.Core
 import           Transient.Internal.Backend
 import           Transient.Internal.SqlValue
+import           Transient.PostgreSQL.Backend
 import           Transient.SqlQuery
 
-import qualified Data.ByteString             as BS
-import           Data.Data                   (Data)
-import           Data.Int                    (Int64)
+import qualified Data.ByteString              as BS
+import           Data.Data                    (Data)
+import           Data.Int                     (Int64)
 
 data NewTest = NewTest
-    { newTestId   :: Maybe Int64
-    , newTestTest :: Int64
-    , newTestBool :: Maybe Bool
+    { id   :: Maybe Int64
+    , test :: Int64
+    , bool :: Maybe Bool
     }
 data Test = Test
-    { testId   :: Int64
-    , testTest :: Int64
-    , testBool :: Maybe Bool
+    { id   :: Int64
+    , test :: Int64
+    , bool :: Maybe Bool
     } deriving (Show, Eq, Data)
 
 data DTOTest = DTOTest
-    { dtoField1 :: Int64
-    , dtoField2 :: Int64
+    { field1 :: Int64
+    , field2 :: Int64
     } deriving (Show, Eq, Data)
 
-testT :: Table NewTest Test
+testT :: Table Postgres NewTest Test
 testT = table "test" $ Test
-            <$> field newTestId ("id" serial)
-            <*> field newTestTest "test"
-            <*> field newTestBool "bool"
+            <$> field (.id) ("id" serial)
+            <*> field (.test) "test"
+            <*> field (.bool) "bool"
 
-inTransaction :: SpecWith Backend -> SpecWith Backend
+inTransaction :: SpecWith (Backend Postgres) -> SpecWith (Backend Postgres)
 inTransaction =
     aroundWith $ \action conn ->
         bracket
@@ -52,7 +55,7 @@ inTransaction =
          (\_ -> connExecute conn "ROLLBACK" [])
          (\_ -> action conn)
 
-withTable :: SpecWith Backend -> SpecWith Backend
+withTable :: SpecWith (Backend Postgres) -> SpecWith (Backend Postgres)
 withTable =
     beforeAllWith $
         \conn -> do
@@ -60,7 +63,7 @@ withTable =
             createTable conn testT
             pure conn
 
-spec :: SpecWith Backend
+spec :: SpecWith (Backend Postgres)
 spec = withTable $ inTransaction $ do
    it "can insert new values with defaults" $ \conn -> do
        i <- insertMany conn testT [ NewTest Nothing 42 Nothing
@@ -69,7 +72,7 @@ spec = withTable $ inTransaction $ do
        i `shouldBe` 2
        x <- runSelectUnique conn do
                t <- from testT
-               where_ $ t ^. #testTest ==. val 42
+               where_ $ t.test ==. val 42
                select t
        x `shouldBe` Just (Test 1 42 Nothing)
 
@@ -84,15 +87,15 @@ spec = withTable $ inTransaction $ do
                               & innerJoin_ testT
                                 `on_` do
                                     \(t :& t2) ->
-                                        t ^. #testId ==. t2 ^. #testId
+                                        t.id ==. t2.id
                           `on_` do
                             \(t :& (_ :& t3)) ->
-                                t ^. #testId /=. t3 ^. #testId
+                                t.id /=. t3.id
                         & leftJoin_ testT
                           `on_` \(t :& _ :& t4) ->
-                             t ^. #testId /=. t ^. #testId
-                where_ $ t ^. #testId ==. val 1
-                select (t ^. #testTest :& t2 ?. #testTest)
+                             t.id /=. t.id
+                where_ $ t.id ==. val 1
+                select (t.test :& t2.test)
        x `shouldBe` [84 :& Just 24]
 
    it "can insert into" $ \conn -> do
@@ -112,7 +115,7 @@ spec = withTable $ inTransaction $ do
                 (r :& r2) <- from $
                      from $
                      from (table_ testT & crossJoin_ testT)
-                select (r :& r2 ^. #testId)
+                select (r :& r2.id)
        x `shouldBe` [ (Test 1 84 Nothing :& 1), (Test 1 84 Nothing :& 2)
                     , (Test 2 24 Nothing :& 1), (Test 2 24 Nothing :& 2)
                     ]
@@ -120,12 +123,11 @@ spec = withTable $ inTransaction $ do
    it "can use custom dtos" $ \conn -> do
        i <- insertMany conn testT [ NewTest (Just 1) 84 Nothing, NewTest (Just 2) 24 Nothing ]
        x <- runSelectMany conn do
-                r <- from do
+                (r :& r2) <- from do
                        t <- from testT
-                       select $
-                        DTOTest
-                            <$> select_ (t ^. #testId)
-                            <*> select_ (t ^. #testTest)
-                select (r :& r ^. #dtoField1)
+                       let dtoTest = DTOTest <$> select_ t.id
+                                             <*> select_ t.test
+                       pure (dtoTest :& dtoTest)
+                select (r :& r2.field1)
        x `shouldBe` [ (DTOTest 1 84 :& 1), (DTOTest 2 24 :& 2) ]
 

@@ -37,112 +37,10 @@ import           Transient.Internal.Backend
 import           Transient.Internal.SqlType
 import           Transient.Internal.SqlValue
 
-class AutoType a where
-    auto :: SqlType a
+type Encoder be a = a -> [SqlValue be]
+type Decoder be a = [SqlValue be] -> Maybe (a, [SqlValue be])
 
-notNullable :: SqlType (Maybe a) -> SqlType a
-notNullable base =
-    base{ sqlTypeConstraints = sqlTypeConstraints base <> ["NOT NULL"]
-        , toSqlType = toSqlType base . Just
-        , fromSqlType = \case
-            SqlNull -> Nothing
-            value   -> join $ fromSqlType base value
-        }
-
-newtype DefaultExpression a = DefaultExpression
-    { unDefaultExpression :: BS.ByteString }
-
-currentTimestamp :: DefaultExpression UTCTime
-currentTimestamp = DefaultExpression "CURRENT_TIMESTAMP"
-
-defaultTo :: DefaultExpression a -> SqlType (Maybe a) -> SqlType' (Maybe a) a
-defaultTo defaultExpression base =
-    base{ sqlTypeConstraints = sqlTypeConstraints base <> [" DEFAULT " <> unDefaultExpression defaultExpression]
-        , fromSqlType = fromSqlType (notNullable base)
-        }
-
-serial :: SqlType' (Maybe Int64) Int64
-serial =
-    SqlType
-        { sqlType = "SERIAL"
-        , sqlTypeConstraints = []
-        , toSqlType = \case
-            Just i  -> SqlInt i
-            Nothing -> SqlDefault
-        , fromSqlType = \case
-            SqlInt value -> Just value
-            _            -> Nothing
-        }
-
-nullableSqlType :: BS.ByteString -> (a -> SqlValue) -> (SqlValue -> Maybe a) -> SqlType (Maybe a)
-nullableSqlType typeName to from =
-    SqlType
-        { sqlType = typeName
-        , sqlTypeConstraints = []
-        , toSqlType = \case
-            Just x  -> to x
-            Nothing -> SqlDefault
-        , fromSqlType = \case
-            SqlNull -> Just Nothing
-            value   -> fmap Just (from value)
-        }
-
-timestamptz :: SqlType (Maybe UTCTime)
-timestamptz =
-    nullableSqlType "timestamptz"
-                    SqlUTCTime
-                    (\case
-                        SqlUTCTime t -> Just t
-                        _            -> Nothing
-                    )
-
-instance AutoType Int64 where
-    auto = notNullable bigInt
-instance AutoType (Maybe Int64) where
-    auto = bigInt
-
-bigInt :: SqlType (Maybe Int64)
-bigInt =
-    nullableSqlType "BIGINT"
-                    SqlInt
-                    (\case
-                        SqlInt i -> Just i
-                        _        -> Nothing
-                    )
-
-instance AutoType T.Text where
-    auto = notNullable text
-instance AutoType (Maybe T.Text) where
-    auto = text
-
-text :: SqlType (Maybe T.Text)
-text =
-    nullableSqlType "TEXT"
-                    SqlString
-                    (\case
-                        SqlString s -> Just s
-                        _           -> Nothing
-                    )
-
-instance AutoType Bool where
-    auto = notNullable bool
-instance AutoType (Maybe Bool) where
-    auto = bool
-
-bool :: SqlType (Maybe Bool)
-bool =
-    nullableSqlType
-        "BOOL"
-        SqlBool
-        (\case
-            SqlBool b -> Just b
-            _         -> Nothing
-        )
-
-type Encoder a = a -> [SqlValue]
-type Decoder a = [SqlValue] -> Maybe (a, [SqlValue])
-
-fieldParser :: SqlType' x a -> Decoder a
+fieldParser :: SqlType' be x a -> Decoder be a
 fieldParser sqlType vs = do
     let vHead:vTail = vs
     r <- fromSqlType sqlType vHead
@@ -154,21 +52,21 @@ data FieldDef = FieldDef
     , fieldConstraints :: [BS.ByteString]
     } deriving Show
 
-data Table i o = Table
-    { tableEncoder  :: Encoder i
-    , tableDecoder  :: Decoder o
+data Table be i o = Table
+    { tableEncoder  :: Encoder be i
+    , tableDecoder  :: Decoder be o
     , tableName     :: BS.ByteString
     , tableFields   :: [FieldDef]
     , tableFieldMap :: Map String BS.ByteString
     }
 
-data Fields x i o = Fields
-    { fieldsEncoder   :: Encoder i
-    , fieldsDecoder   :: Decoder o
+data Fields be x i o = Fields
+    { fieldsEncoder   :: Encoder be i
+    , fieldsDecoder   :: Decoder be o
     , fieldsFieldDefs :: [FieldDef]
     } deriving Functor
 
-instance Applicative (Fields x i) where
+instance Applicative (Fields be x i) where
     pure a = Fields
         { fieldsDecoder = \vs -> Just (a, vs)
         , fieldsEncoder = \_ -> []
@@ -184,7 +82,7 @@ instance Applicative (Fields x i) where
         , fieldsFieldDefs = fieldsFieldDefs a <> fieldsFieldDefs b
         }
 
-table :: forall o i. Data o => BS.ByteString -> Fields o i o -> Table i o
+table :: forall o i be. Data o => BS.ByteString -> Fields be o i o -> Table be i o
 table tableName fields =
     let tableType = dataTypeOf (undefined :: o)
         recordFields = constrFields $ indexConstr tableType 1
@@ -198,37 +96,37 @@ table tableName fields =
         , tableFieldMap = fieldMap
         }
 
-data EntityField ent i o = EntityField
+data EntityField be ent i o = EntityField
     { entityFieldName :: BS.ByteString
-    , entityFieldType :: SqlType' i o
+    , entityFieldType :: SqlType' be i o
     }
 
-class SqlField (field :: Symbol) entity input output | entity field -> input output where
-    fieldDescriptor :: EntityField entity input output
+class SqlField (field :: Symbol) be entity input output | be entity field -> input output where
+    fieldDescriptor :: EntityField be entity input output
 
-instance SqlField field entity input output => IsLabel field (EntityField entity input output) where
+instance SqlField field be entity input output => IsLabel field (EntityField be entity input output) where
     fromLabel = fieldDescriptor @field
 
-type SimpleField rec a = EntityField rec a a
-instance AutoType t => IsString (EntityField r t t) where
+type SimpleField be rec a = EntityField be rec a a
+instance AutoType be t => IsString (EntityField be r t t) where
     fromString s = EntityField (fromString s) auto
 
-instance IsString (SqlType' i o -> EntityField r i o) where
+instance IsString (SqlType' be i o -> EntityField be r i o) where
     fromString s = EntityField (fromString s)
 
-fieldDef :: EntityField x i o -> FieldDef
+fieldDef :: EntityField be x i o -> FieldDef
 fieldDef (EntityField fieldName t) =
     FieldDef fieldName (sqlType t) (sqlTypeConstraints t)
 
-field :: (rec -> i) -> EntityField x i o -> Fields x rec o
+field :: (rec -> i) -> EntityField be x i o -> Fields be x rec o
 field fromRec f@(EntityField _ t) =
     Fields
         { fieldsFieldDefs = [fieldDef f]
         , fieldsDecoder = fieldParser t
-        , fieldsEncoder = List.singleton . toSqlType t . fromRec
+        , fieldsEncoder = List.singleton . toSqlType t CommandContext . fromRec
         }
 
-createTable :: Backend -> Table i o -> IO Int64
+createTable :: Backend be -> Table be i o -> IO Int64
 createTable c t =
     let renderField f =
             fieldName f <> " " <> fieldType f <> " " <> BS.intercalate " " (fieldConstraints f)
@@ -237,7 +135,7 @@ createTable c t =
                     <> ")"
     in connExecute c stmt []
 
-insertMany :: Backend -> Table i x -> [i] -> IO Int64
+insertMany :: Backend be -> Table be i x -> [i] -> IO Int64
 insertMany c t vals =
     let commas = BS.intercalate ", "
         fieldsPlaceholder fieldCount =
