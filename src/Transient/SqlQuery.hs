@@ -1,6 +1,7 @@
 {-# LANGUAGE BlockArguments             #-}
 {-# LANGUAGE DeriveFunctor              #-}
 {-# LANGUAGE DerivingStrategies         #-}
+{-# LANGUAGE FlexibleContexts           #-}
 {-# LANGUAGE FlexibleInstances          #-}
 {-# LANGUAGE FunctionalDependencies     #-}
 {-# LANGUAGE GADTs                      #-}
@@ -501,8 +502,11 @@ crossJoin_ joinFrom baseFrom = From do
 leftJoin_ :: (AsFrom be fa a, AsFrom be fb b, ToMaybe b mb) => Join be fa a fb b (a :& mb)
 leftJoin_ = joinHelper "LEFT JOIN" (\a b -> a :& toMaybe b)
 
-instance ( KnownSymbol field, HasField field rec res)
-  => HasField field (SqlRecord be n rec) (SqlExpr be n res) where
+class ConvertMaybeToNullable a n res n' | a n -> n' res where
+instance (a ~ Maybe b, n' ~ Nullable) => ConvertMaybeToNullable a n b n' where
+instance {-# OVERLAPPING #-} ConvertMaybeToNullable a n a n where
+instance (KnownSymbol field, HasField field rec a, ConvertMaybeToNullable a n res n')
+  => HasField field (SqlRecord be n rec) (SqlExpr be n' res) where
     getField rec = projectField rec $ symbolVal (Proxy @field)
 
 infixr 9 ^., ?., ??.
@@ -513,7 +517,7 @@ infixr 9 ^., ?., ??.
 (?.) ent field = projectField ent (fieldSelectorName field)
 
 (??.) :: SqlRecord be Nullable rec -> FieldSelector rec (Maybe o) -> SqlExpr be Nullable o
-(??.) ent field = nullable_ $ ent ?. field
+(??.) ent field = projectField ent (fieldSelectorName field)
 
 data FieldSelector rec a = FieldSelector
     { fieldSelectorName :: String }

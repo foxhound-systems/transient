@@ -95,8 +95,8 @@ spec = withTable $ inTransaction $ do
                           `on_` \(t :& _ :& t4) ->
                              t.id /=. t.id
                 where_ $ t.id ==. val 1
-                select (t.test :& t2.test)
-       x `shouldBe` [84 :& Just 24]
+                select (t.test :& t2.test :& t4.bool)
+       x `shouldBe` [84 :& Just 24 :& Nothing]
 
    it "can insert into" $ \conn -> do
        i <- insertInto conn testT do
