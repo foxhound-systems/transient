@@ -1,13 +1,29 @@
+{-# LANGUAGE FlexibleContexts      #-}
 {-# LANGUAGE FlexibleInstances     #-}
+{-# LANGUAGE GADTs                 #-}
+{-# LANGUAGE KindSignatures        #-}
 {-# LANGUAGE LambdaCase            #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE OverloadedStrings     #-}
-{-# LANGUAGE TypeFamilies          #-}
+{-# LANGUAGE ScopedTypeVariables   #-}
+{-# LANGUAGE StandaloneDeriving    #-}
+{-# LANGUAGE TypeApplications      #-}
 module Transient.PostgreSQL.Backend
+    ( PgValue
+    , withBackend
+    , mkBackend
+    , defaultTo
+    , nullable
+    , serial
+    , bigInt
+    , text
+    , bool
+    , timestamptz
+    )
     where
 
 import           Control.Exception                    (bracket, throwIO)
-import           Control.Monad                        (join, when)
+import           Control.Monad                        (join, unless)
 import qualified Data.ByteString                      as BS
 import           Data.Coerce                          (coerce)
 import           Data.Either                          (fromRight)
@@ -21,32 +37,39 @@ import           System.IO.Unsafe                     (unsafeDupablePerformIO)
 import           Transient.Internal.Backend
 import           Transient.Internal.SqlDialect
 import           Transient.Internal.SqlType
-import           Transient.Internal.SqlValue
+import           Type.Reflection
 
+import           Data.ByteString                      (ByteString)
 import qualified Data.Text                            as T
 import           Data.Time.Clock                      (UTCTime)
 
-data Postgres
-instance SqlBackend Postgres where
-    data SqlValue Postgres
-        = SqlString T.Text
-        | SqlInt Int64
-        | SqlUTCTime UTCTime
-        | SqlBool Bool
-        | SqlNull
-        | SqlDefault
-        | SqlUnknown BS.ByteString
-        deriving (Eq, Show)
+cast :: forall a b. (Typeable a, Typeable b) => a -> Maybe b
+cast a =
+    case eqTypeRep (typeRep @a) (typeRep @b) of
+      Just HRefl -> Just a
+      Nothing    -> Nothing
 
-    nullValue = SqlNull
+data PgValue where
+    SqlNull :: PgValue
+    SqlDefault :: PgValue
+    SqlField :: (Show f, FromField f, ToField f) => TypeRep (f :: *) -> f -> PgValue
 
-notNullable :: SqlType Postgres (Maybe a) -> SqlType Postgres a
-notNullable base =
-    base{ sqlTypeConstraints = sqlTypeConstraints base <> ["NOT NULL"]
-        , toSqlType = \ctx -> toSqlType base ctx . Just
+deriving instance Show PgValue
+
+instance SqlBackend PgValue where
+    isNullValue SqlNull = True
+    isNullValue _       = False
+
+instance AutoType PgValue a => AutoType PgValue (Maybe a) where
+    auto = nullable auto
+nullable :: SqlType PgValue a -> SqlType PgValue (Maybe a)
+nullable base =
+    base{ sqlTypeConstraints = []
+        , sqlTypeIsNullable = True
+        , toSqlType = maybe SqlNull . toSqlType base
         , fromSqlType = \case
             SqlNull -> Nothing
-            value   -> join $ fromSqlType base value
+            value   -> Just <$> fromSqlType base value
         }
 
 newtype DefaultExpression a = DefaultExpression
@@ -55,113 +78,74 @@ newtype DefaultExpression a = DefaultExpression
 currentTimestamp :: DefaultExpression UTCTime
 currentTimestamp = DefaultExpression "CURRENT_TIMESTAMP"
 
-defaultTo :: DefaultExpression a -> SqlType Postgres (Maybe a) -> SqlType' Postgres (Maybe a) a
+defaultTo :: DefaultExpression a -> SqlType PgValue a -> SqlType' PgValue (Maybe a) a
 defaultTo defaultExpression base =
     base{ sqlTypeConstraints = sqlTypeConstraints base <> [" DEFAULT " <> unDefaultExpression defaultExpression]
+        , sqlTypeIsNullable = False
         , toSqlType = \ctx -> \case
             Just v  ->
-                toSqlType base ctx (Just v)
+                toSqlType base ctx v
             Nothing ->
                 case ctx of
                   QueryContext   -> SqlNull
                   CommandContext -> SqlDefault
-        , fromSqlType = fromSqlType (notNullable base)
+        , fromSqlType = fromSqlType base
         }
 
-serial :: SqlType' Postgres (Maybe Int64) Int64
+serial :: SqlType' PgValue (Maybe Int64) Int64
 serial =
     SqlType
         { sqlType = "SERIAL"
         , sqlTypeConstraints = []
+        , sqlTypeIsNullable = False
         , toSqlType = \ctx -> \case
-            Just i  -> SqlInt i
+            Just i  -> SqlField typeRep i
             Nothing ->
                 case ctx of
                   QueryContext   -> SqlNull
                   CommandContext -> SqlDefault
-        , fromSqlType = \case
-            SqlInt value -> Just value
-            _            -> Nothing
+        , fromSqlType = fromSqlField
         }
 
-nullableSqlType :: BS.ByteString -> (a -> SqlValue Postgres) -> (SqlValue Postgres -> Maybe a) -> SqlType Postgres (Maybe a)
-nullableSqlType typeName to from =
+fromSqlField :: (Typeable a, FromField a) => PgValue -> Maybe a
+fromSqlField (SqlField rep value) = withTypeable rep (cast value)
+fromSqlField _                    = Nothing
+
+mkSqlType :: (Show a, Typeable a, FromField a, ToField a) => BS.ByteString -> SqlType PgValue a
+mkSqlType typeName =
     SqlType
         { sqlType = typeName
         , sqlTypeConstraints = []
-        , toSqlType = \ctx -> \case
-            Just v  ->
-                to v
-            Nothing ->
-                case ctx of
-                  QueryContext   -> SqlNull
-                  CommandContext -> SqlDefault
-        , fromSqlType = \case
-            SqlNull -> Just Nothing
-            value   -> fmap Just (from value)
+        , sqlTypeIsNullable = False
+        , toSqlType = \_ -> SqlField typeRep
+        , fromSqlType = fromSqlField
         }
 
-timestamptz :: SqlType Postgres (Maybe UTCTime)
-timestamptz =
-    nullableSqlType "timestamptz"
-                    SqlUTCTime
-                    (\case
-                        SqlUTCTime t -> Just t
-                        _            -> Nothing
-                    )
+instance AutoType PgValue UTCTime where
+    auto = timestamptz
+timestamptz :: SqlType PgValue UTCTime
+timestamptz = mkSqlType "timestamptz"
 
-instance AutoType Postgres Int64 where
-    auto = notNullable bigInt
-instance AutoType Postgres (Maybe Int64) where
+instance AutoType PgValue Int64 where
     auto = bigInt
+bigInt :: SqlType PgValue Int64
+bigInt = mkSqlType "int8"
 
-bigInt :: SqlType Postgres (Maybe Int64)
-bigInt =
-    nullableSqlType "BIGINT"
-                    SqlInt
-                    (\case
-                        SqlInt i -> Just i
-                        _        -> Nothing
-                    )
-
-instance AutoType Postgres T.Text where
-    auto = notNullable text
-instance AutoType Postgres (Maybe T.Text) where
+instance AutoType PgValue T.Text where
     auto = text
+text :: SqlType PgValue T.Text
+text = mkSqlType "text"
 
-text :: SqlType Postgres (Maybe T.Text)
-text =
-    nullableSqlType "TEXT"
-                    SqlString
-                    (\case
-                        SqlString s -> Just s
-                        _           -> Nothing
-                    )
-
-instance AutoType Postgres Bool where
-    auto = notNullable bool
-instance AutoType Postgres (Maybe Bool) where
+instance AutoType PgValue Bool where
     auto = bool
+bool :: SqlType PgValue Bool
+bool = mkSqlType "bool"
 
-bool :: SqlType Postgres (Maybe Bool)
-bool =
-    nullableSqlType
-        "BOOL"
-        SqlBool
-        (\case
-            SqlBool b -> Just b
-            _         -> Nothing
-        )
+withBackend :: ConnectInfo -> (Backend PgValue -> IO a) -> IO a
+withBackend connInfo =
+    bracket (mkBackend <$> connect connInfo) connClose
 
-withBackend :: ConnectInfo -> (Backend Postgres -> IO a) -> IO a
-withBackend connInfo k =
-    bracket
-        (mkBackend <$> connect connInfo)
-        (connClose)
-        k
-
-
-mkBackend :: PS.Connection -> Backend Postgres
+mkBackend :: PS.Connection -> Backend PgValue
 mkBackend connection =
     Backend
         { connTag     = "postgresql"
@@ -179,46 +163,48 @@ mkDialect conn =
               Right r -> r
         }
 
-runQuery :: PS.Connection -> BS.ByteString -> [SqlValue Postgres] -> IO [[SqlValue Postgres]]
+runQuery :: PS.Connection -> BS.ByteString -> [PgValue] -> IO [[PgValue]]
 runQuery conn q vals = do
     print q
-    when (not $ null vals) $
+    unless (null vals) $
         print vals
     query conn (Query q) (fmap valToField vals)
 
-runExecute :: PS.Connection -> BS.ByteString -> [SqlValue Postgres] -> IO Int64
+runExecute :: PS.Connection -> BS.ByteString -> [PgValue] -> IO Int64
 runExecute conn q vals = do
     print q
-    when (not $ null vals) $
+    unless (null vals) $
         print vals
     execute conn (Query q) (fmap valToField vals)
 
-instance FromField (SqlValue Postgres) where
+instance FromField PgValue where
     fromField = valFromField
 
-valFromField :: FieldParser (SqlValue Postgres)
+valFromField :: FieldParser PgValue
 valFromField f mv = do
     typ <- typename f
     case mv of
       Nothing ->
           pure SqlNull
-      Just v ->
-        case typ of
-          "bool"        -> SqlBool <$> fromField f mv
-          "int2"        -> SqlInt <$> fromField f mv
-          "int4"        -> SqlInt <$> fromField f mv
-          "int8"        -> SqlInt <$> fromField f mv
-          "timestamp"   -> SqlUTCTime <$> fromField f mv
-          "timestamptz" -> SqlUTCTime <$> fromField f mv
-          "bpchar"      -> SqlString <$> fromField f mv
-          "varchar"     -> SqlString <$> fromField f mv
-          "text"        -> SqlString <$> fromField f mv
-          _             -> pure $ SqlUnknown v
+      Just _ ->
+          (case typ of
+              "bool"        -> sqlField $ typeRep @Bool
+              "int2"        -> sqlField $ typeRep @Int64
+              "int4"        -> sqlField $ typeRep @Int64
+              "int8"        -> sqlField $ typeRep @Int64
+              "timestamp"   -> sqlField $ typeRep @UTCTime
+              "timestamptz" -> sqlField $ typeRep @UTCTime
+              "bpchar"      -> sqlField $ typeRep @T.Text
+              "varchar"     -> sqlField $ typeRep @T.Text
+              "text"        -> sqlField $ typeRep @T.Text
+              _             -> sqlField $ typeRep @ByteString
+          ) f mv
 
-valToField :: SqlValue Postgres -> Action
-valToField (SqlInt i)     = toField i
-valToField (SqlString s)  = toField s
-valToField (SqlUTCTime t) = toField t
-valToField (SqlBool b)    = toField b
+
+sqlField :: (Show a, ToField a, FromField a) => TypeRep a -> FieldParser PgValue
+sqlField rep f mv = SqlField rep <$> fromField f mv
+
+valToField :: PgValue -> Action
+valToField (SqlField _ v) = toField v
 valToField SqlNull        = Plain "NULL"
 valToField SqlDefault     = Plain "DEFAULT"

@@ -4,12 +4,11 @@ module Transient.Internal.Backend
 import qualified Data.ByteString               as BS
 import           Data.Int                      (Int64)
 import           Transient.Internal.SqlDialect
-import           Transient.Internal.SqlValue
 
-data Backend be = Backend
+data Backend value = Backend
     { connTag     :: BS.ByteString
     , connDialect :: SqlDialect
-    , connQuery   :: BS.ByteString -> [SqlValue be] -> IO [[SqlValue be]]
-    , connExecute :: BS.ByteString -> [SqlValue be] -> IO Int64
+    , connQuery   :: BS.ByteString -> [value] -> IO [[value]]
+    , connExecute :: BS.ByteString -> [value] -> IO Int64
     , connClose   :: IO ()
     }

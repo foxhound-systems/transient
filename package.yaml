@@ -44,4 +44,5 @@ tests:
     - transient
     - hspec
     - bytestring
+    - mtl
     - postgresql-simple

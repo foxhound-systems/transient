@@ -1,6 +1,6 @@
 cabal-version: 1.12
 
--- This file has been generated from package.yaml by hpack version 0.34.4.
+-- This file has been generated from package.yaml by hpack version 0.35.1.
 --
 -- see: https://github.com/sol/hpack
 
@@ -30,7 +30,6 @@ library
       Transient.Internal.Backend
       Transient.Internal.SqlDialect
       Transient.Internal.SqlType
-      Transient.Internal.SqlValue
       Transient.PostgreSQL.Backend
       Transient.SqlQuery
   other-modules:
@@ -61,6 +60,7 @@ test-suite transient-test
       base >=4.7 && <5
     , bytestring
     , hspec
+    , mtl
     , postgresql-simple
     , transient
   default-language: Haskell2010

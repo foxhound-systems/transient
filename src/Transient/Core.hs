@@ -11,36 +11,37 @@
 {-# LANGUAGE UndecidableInstances   #-}
 
 module Transient.Core
-    ( SqlValue(..)
-    , SqlType'(..)
+    ( SqlType'(..)
     , SqlType
     , module Transient.Core
     )
     where
 
-import           Control.Monad               (join)
-import qualified Data.ByteString             as BS
-import           Data.Data                   (Data, constrFields, dataTypeOf,
-                                              indexConstr)
-import           Data.Int                    (Int64)
-import qualified Data.List                   as List
-import           Data.Map.Strict             (Map)
-import qualified Data.Map.Strict             as Map
-import           Data.String                 (IsString (..))
-import qualified Data.Text                   as T
-import           Data.Time.Clock             (UTCTime)
-import           Data.Void                   (Void, absurd)
+import           Control.Monad                 (join)
+import           Control.Monad.Reader          (ReaderT, ask, liftIO)
+import qualified Data.ByteString               as BS
+import qualified Data.ByteString.Builder       as BSB
+import           Data.Data                     (Data, constrFields, dataTypeOf,
+                                                indexConstr)
+import           Data.Int                      (Int64)
+import qualified Data.List                     as List
+import           Data.Map.Strict               (Map)
+import qualified Data.Map.Strict               as Map
+import           Data.String                   (IsString (..))
+import qualified Data.Text                     as T
+import           Data.Time.Clock               (UTCTime)
+import           Data.Void                     (Void, absurd)
 import           GHC.OverloadedLabels
-import           GHC.TypeLits                (Symbol, symbolVal)
+import           GHC.TypeLits                  (Symbol, symbolVal)
 
 import           Transient.Internal.Backend
+import           Transient.Internal.SqlDialect
 import           Transient.Internal.SqlType
-import           Transient.Internal.SqlValue
 
-type Encoder be a = a -> [SqlValue be]
-type Decoder be a = [SqlValue be] -> Maybe (a, [SqlValue be])
+type Encoder sqlValue a = a -> [sqlValue]
+type Decoder sqlValue a = [sqlValue] -> Maybe (a, [sqlValue])
 
-fieldParser :: SqlType' be x a -> Decoder be a
+fieldParser :: SqlType' sqlValue x a -> Decoder sqlValue a
 fieldParser sqlType vs = do
     let vHead:vTail = vs
     r <- fromSqlType sqlType vHead
@@ -52,21 +53,21 @@ data FieldDef = FieldDef
     , fieldConstraints :: [BS.ByteString]
     } deriving Show
 
-data Table be i o = Table
-    { tableEncoder  :: Encoder be i
-    , tableDecoder  :: Decoder be o
+data Table sqlValue i o = Table
+    { tableEncoder  :: Encoder sqlValue i
+    , tableDecoder  :: Decoder sqlValue o
     , tableName     :: BS.ByteString
     , tableFields   :: [FieldDef]
     , tableFieldMap :: Map String BS.ByteString
     }
 
-data Fields be x i o = Fields
-    { fieldsEncoder   :: Encoder be i
-    , fieldsDecoder   :: Decoder be o
+data Fields sqlValue x i o = Fields
+    { fieldsEncoder   :: Encoder sqlValue i
+    , fieldsDecoder   :: Decoder sqlValue o
     , fieldsFieldDefs :: [FieldDef]
     } deriving Functor
 
-instance Applicative (Fields be x i) where
+instance Applicative (Fields sqlValue x i) where
     pure a = Fields
         { fieldsDecoder = \vs -> Just (a, vs)
         , fieldsEncoder = \_ -> []
@@ -82,7 +83,7 @@ instance Applicative (Fields be x i) where
         , fieldsFieldDefs = fieldsFieldDefs a <> fieldsFieldDefs b
         }
 
-table :: forall o i be. Data o => BS.ByteString -> Fields be o i o -> Table be i o
+table :: forall o i sqlValue. Data o => BS.ByteString -> Fields sqlValue o i o -> Table sqlValue i o
 table tableName fields =
     let tableType = dataTypeOf (undefined :: o)
         recordFields = constrFields $ indexConstr tableType 1
@@ -96,29 +97,32 @@ table tableName fields =
         , tableFieldMap = fieldMap
         }
 
-data EntityField be ent i o = EntityField
+data EntityField sqlValue ent i o = EntityField
     { entityFieldName :: BS.ByteString
-    , entityFieldType :: SqlType' be i o
+    , entityFieldType :: SqlType' sqlValue i o
     }
 
-class SqlField (field :: Symbol) be entity input output | be entity field -> input output where
-    fieldDescriptor :: EntityField be entity input output
+class SqlField (field :: Symbol) sqlValue entity input output | sqlValue entity field -> input output where
+    fieldDescriptor :: EntityField sqlValue entity input output
 
-instance SqlField field be entity input output => IsLabel field (EntityField be entity input output) where
+instance SqlField field sqlValue entity input output => IsLabel field (EntityField sqlValue entity input output) where
     fromLabel = fieldDescriptor @field
 
-type SimpleField be rec a = EntityField be rec a a
-instance AutoType be t => IsString (EntityField be r t t) where
+type SimpleField sqlValue rec a = EntityField sqlValue rec a a
+instance AutoType sqlValue t => IsString (EntityField sqlValue r t t) where
     fromString s = EntityField (fromString s) auto
 
-instance IsString (SqlType' be i o -> EntityField be r i o) where
+instance IsString (SqlType' sqlValue i o -> EntityField sqlValue r i o) where
     fromString s = EntityField (fromString s)
 
-fieldDef :: EntityField be x i o -> FieldDef
+fieldDef :: EntityField sqlValue x i o -> FieldDef
 fieldDef (EntityField fieldName t) =
-    FieldDef fieldName (sqlType t) (sqlTypeConstraints t)
+    let nullable = if not $ sqlTypeIsNullable t
+                      then ["NOT NULL"]
+                      else mempty
+    in FieldDef fieldName (sqlType t) (nullable <> sqlTypeConstraints t)
 
-field :: (rec -> i) -> EntityField be x i o -> Fields be x rec o
+field :: (rec -> i) -> EntityField sqlValue x i o -> Fields sqlValue x rec o
 field fromRec f@(EntityField _ t) =
     Fields
         { fieldsFieldDefs = [fieldDef f]
@@ -126,7 +130,7 @@ field fromRec f@(EntityField _ t) =
         , fieldsEncoder = List.singleton . toSqlType t CommandContext . fromRec
         }
 
-createTable :: Backend be -> Table be i o -> IO Int64
+createTable :: Backend sqlValue-> Table sqlValue i o -> IO Int64
 createTable c t =
     let renderField f =
             fieldName f <> " " <> fieldType f <> " " <> BS.intercalate " " (fieldConstraints f)
@@ -135,15 +139,33 @@ createTable c t =
                     <> ")"
     in connExecute c stmt []
 
-insertMany :: Backend be -> Table be i x -> [i] -> IO Int64
-insertMany c t vals =
-    let commas = BS.intercalate ", "
-        fieldsPlaceholder fieldCount =
-            "(" <> commas (replicate fieldCount "?") <> ")"
-        fieldValues fieldCount =
-            " VALUES " <> commas (replicate (length vals) (fieldsPlaceholder fieldCount))
-    in connExecute c
-        ("INSERT INTO " <> tableName t
-                   <> " (" <> commas (fmap fieldName (tableFields t)) <> ")"
-                   <> fieldValues (length $ tableFields t)) (join $ fmap (tableEncoder t) vals)
+runBuilder :: BSB.Builder -> BS.ByteString
+runBuilder = BS.toStrict . BSB.toLazyByteString
 
+commas :: [BSB.Builder] -> BSB.Builder
+commas = mconcat . List.intersperse ", "
+
+insertMany :: Table sqlValue i x -> [i] -> ReaderT (Backend sqlValue) IO Int64
+insertMany t vals =
+    insertInto t $ values t vals
+
+newtype Insertion sqlValue i = Insertion { runInsertion :: SqlDialect -> (BSB.Builder, [sqlValue]) }
+
+data ConsoleOutBackend
+
+insertInto :: Table sqlValue i x -> Insertion sqlValue i -> ReaderT (Backend sqlValue) IO Int64
+insertInto t insertion = do
+    c <- ask
+    let (insertionText, insertionValues) = runInsertion insertion (connDialect c)
+    liftIO $ connExecute c
+        (runBuilder ("INSERT INTO " <> BSB.byteString (dialectEscapeIdentifier (connDialect c) $ tableName t)
+                <> " (" <> commas (fmap (BSB.byteString . dialectEscapeIdentifier (connDialect c) . fieldName) (tableFields t)) <> ") " <> insertionText))
+        insertionValues
+
+values :: Table sqlValue i x -> [i] -> Insertion sqlValue i
+values t vals =
+    let fieldCount = length $ tableFields t
+        fieldsPlaceholder =
+            "(" <> commas (replicate fieldCount "?") <> ")"
+    in Insertion $ const $
+        ("VALUES " <> commas (replicate (length vals) fieldsPlaceholder), join $ fmap (tableEncoder t) vals)

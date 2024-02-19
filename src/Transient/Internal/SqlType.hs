@@ -3,20 +3,23 @@
 module Transient.Internal.SqlType
     where
 
-import qualified Data.ByteString             as BS
-import           Transient.Internal.SqlValue
+import qualified Data.ByteString as BS
 
-class AutoType be a where
-    auto :: SqlType be a
+class AutoType value a where
+    auto :: SqlType value a
+
+class SqlBackend value where
+    isNullValue :: value -> Bool
 
 data Context
     = QueryContext
     | CommandContext
 
-data SqlType' be i o = SqlType
+data SqlType' value i o = SqlType
     { sqlType            :: BS.ByteString
+    , sqlTypeIsNullable  :: Bool
     , sqlTypeConstraints :: [BS.ByteString]
-    , toSqlType          :: Context -> i -> SqlValue be
-    , fromSqlType        :: SqlValue be -> Maybe o
+    , toSqlType          :: Context -> i -> value
+    , fromSqlType        :: value -> Maybe o
     }
 type SqlType be a = SqlType' be a a
